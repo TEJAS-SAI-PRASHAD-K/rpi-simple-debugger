@@ -120,12 +120,20 @@ Create a file named `rpi_debugger_settings.json` in your project directory:
   "gpio_poll_interval_s": 0.1,
   "network_poll_interval_s": 2.0,
   "system_poll_interval_s": 2.0,
+  "gpio_pins": [17, 18, 22, 27],
+  "gpio_backend": "auto",
   "gpio_labels": [
     { "pin": 17, "label": "Red LED" },
     { "pin": 18, "label": "Green LED" },
     { "pin": 27, "label": "Start Button" },
     { "pin": 22, "label": "Stop Button" }
-  ]
+  ],
+  "cpu_temp_threshold_c": 80.0,
+  "disk_usage_threshold_percent": 90.0,
+  "memory_usage_threshold_percent": 90.0,
+  "wifi_signal_threshold_dbm": -75,
+  "cors_enabled": true,
+  "cors_origins": ["*"]
 }
 ```
 
@@ -141,6 +149,14 @@ Create a file named `rpi_debugger_settings.json` in your project directory:
 | `network_poll_interval_s` | float | `2.0` | How often to check network status (seconds) |
 | `system_poll_interval_s` | float | `2.0` | How often to check system health (seconds) |
 | `gpio_labels` | array | `[]` | Human-readable labels for GPIO pins |
+| `gpio_pins` | array | `null` | Custom list of BCM pins to monitor (uses defaults if null) |
+| `gpio_backend` | string | `"auto"` | GPIO backend: `"auto"`, `"rpi"`, `"gpiozero"`, or `"mock"` |
+| `cpu_temp_threshold_c` | float | `80.0` | CPU temperature threshold for `cpu_hot` health flag |
+| `disk_usage_threshold_percent` | float | `90.0` | Disk usage threshold for `disk_low` health flag |
+| `memory_usage_threshold_percent` | float | `90.0` | Memory usage threshold for `memory_high` health flag |
+| `wifi_signal_threshold_dbm` | int | `-75` | WiFi signal threshold for `wifi_poor` health flag |
+| `cors_enabled` | boolean | `true` | Enable CORS middleware for web dashboards |
+| `cors_origins` | array | `["*"]` | List of allowed CORS origins |
 
 ### Default GPIO Pins
 
@@ -163,12 +179,111 @@ settings = load_settings(Path("/path/to/custom_config.json"))
 
 ## Running the Server
 
-### Basic Usage
+### Package-Level API (Recommended for embedded use)
+
+Start the debugger from your Python code:
+
+```python
+from rpi_simple_debugger import start_debugger_server, DebuggerSettings, push_custom
+
+# Create settings
+settings = DebuggerSettings(
+    gpio_enabled=True,
+    wifi_enabled=True,
+    system_health_enabled=True,
+    gpio_labels=[
+        {"pin": 17, "label": "LED"},
+        {"pin": 27, "label": "Button"},
+    ],
+)
+
+# Start server in background thread
+handle = start_debugger_server(
+    host="0.0.0.0",
+    port=8000,
+    settings=settings,
+)
+
+# Your application code
+print("Debugger server running in background")
+
+# Push custom debug data anytime
+push_custom("my_app", {"state": "starting", "version": "1.0.0"})
+
+# Optional: stop server on shutdown
+# handle.stop()
+```
+
+### Mounting in Existing FastAPI App
+
+```python
+from fastapi import FastAPI
+from rpi_simple_debugger import create_app, DebuggerSettings
+
+main_app = FastAPI(title="My App")
+debug_app = create_app(DebuggerSettings())
+
+# Mount debugger under /debug prefix
+main_app.mount("/debug", debug_app)
+
+# Access at http://localhost:8000/debug/status
+# and ws://localhost:8000/debug/ws
+```
+
+### Standalone Server
 
 Start the server on all network interfaces (accessible from other devices):
 
 ```bash
 uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8000
+```
+
+### Command Line Interface (CLI)
+
+The package includes a CLI tool for easy server startup:
+
+```bash
+# Basic usage
+rpi-debugger
+
+# Custom host and port
+rpi-debugger --host 0.0.0.0 --port 5000
+
+# Use a configuration file
+rpi-debugger --config /path/to/settings.json
+
+# Disable specific features
+rpi-debugger --no-gpio --no-bluetooth
+
+# Use a specific GPIO backend
+rpi-debugger --gpio-backend mock       # For testing
+rpi-debugger --gpio-backend gpiozero   # Alternative backend
+rpi-debugger --gpio-backend rpi        # RPi.GPIO backend
+
+# Development mode with auto-reload
+rpi-debugger --reload
+```
+
+#### CLI Options
+
+| Option | Description |
+|--------|-------------|
+| `--host` | Host address to bind (default: `0.0.0.0`) |
+| `--port` | Port number (default: `8000`) |
+| `--config` | Path to JSON configuration file |
+| `--no-gpio` | Disable GPIO monitoring |
+| `--no-wifi` | Disable WiFi monitoring |
+| `--no-bluetooth` | Disable Bluetooth monitoring |
+| `--no-system` | Disable system health monitoring |
+| `--gpio-backend` | GPIO backend: `auto`, `rpi`, `gpiozero`, `mock` |
+| `--gpio-interval` | GPIO polling interval in seconds |
+| `--reload` | Enable auto-reload (development mode) |
+| `--version` | Show version and exit |
+
+You can also run the module directly:
+
+```bash
+python -m rpi_simple_debugger --help
 ```
 
 ### Development Mode
@@ -242,11 +357,13 @@ sudo systemctl status rpi-debugger
 Returns the current state of all monitors.
 
 **Request:**
+
 ```bash
 curl http://localhost:8000/status
 ```
 
 **Response:** `200 OK`
+
 ```json
 {
   "gpio": {
@@ -280,6 +397,7 @@ curl http://localhost:8000/status
 ```
 
 **Notes:**
+
 - The `gpio` object only contains pins that have changed state at least once
 - All values represent the most recent reading from each monitor
 - `null` values indicate data is unavailable
@@ -291,6 +409,7 @@ curl http://localhost:8000/status
 Establishes a persistent WebSocket connection for real-time updates.
 
 **Connection:**
+
 ```javascript
 const ws = new WebSocket('ws://localhost:8000/ws');
 
@@ -300,12 +419,56 @@ ws.onmessage = (event) => {
 };
 ```
 
+**Initial Snapshot:**
+
+Upon connection, the server immediately sends a full snapshot of the current state:
+
+```json
+{
+  "type": "snapshot",
+  "data": {
+    "gpio": { ... },
+    "wifi": { ... },
+    "bluetooth": { ... },
+    "system_health": { ... },
+    "interfaces": [ ... ],
+    "custom": { ... }
+  }
+}
+```
+
+This ensures clients have the complete state without waiting for updates.
+
+**Heartbeat / Ping-Pong:**
+
+To keep connections alive and detect disconnections, send `"ping"` messages:
+
+```javascript
+// Send ping every 30 seconds
+setInterval(() => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send('ping');
+  }
+}, 30000);
+
+ws.onmessage = (event) => {
+  if (event.data === 'pong') {
+    console.log('Connection alive');
+    return;
+  }
+  // Handle normal messages
+  const message = JSON.parse(event.data);
+  // ...
+};
+```
+
 **Message Format:**
 
 All messages follow this structure:
+
 ```json
 {
-  "type": "gpio|wifi|bluetooth|system",
+  "type": "gpio|wifi|bluetooth|system|snapshot",
   "data": { ... }
 }
 ```
@@ -408,10 +571,62 @@ ws.on('error', (error) => {
 ### How It Works
 
 The GPIO monitor:
+
 1. Configures specified pins as inputs with BCM numbering
 2. Polls each pin at the configured interval (default: 0.1s)
 3. Detects state changes (0→1 or 1→0)
 4. Broadcasts changes via WebSocket
+
+### GPIO Backends
+
+The debugger supports multiple GPIO backends:
+
+| Backend | Description |
+|---------|-------------|
+| `auto` | Automatically selects the best available backend (default) |
+| `rpi` | Uses RPi.GPIO library (classic) |
+| `gpiozero` | Uses gpiozero library (modern, recommended) |
+| `mock` | Simulated GPIO for testing on non-Raspberry Pi systems |
+
+**Selecting a Backend:**
+
+```json
+{
+  "gpio_backend": "gpiozero"
+}
+```
+
+Or via CLI:
+
+```bash
+rpi-debugger --gpio-backend gpiozero
+```
+
+**Backend Selection Order (auto mode):**
+
+1. RPi.GPIO (if available)
+2. gpiozero (if available)
+3. Mock backend (fallback)
+
+**Installing gpiozero:**
+
+```bash
+pip install gpiozero
+# Or install with the raspberry extra:
+pip install rpi-simple-debugger[raspberry]
+```
+
+### Custom GPIO Pins
+
+By default, the debugger monitors BCM pins: `2, 3, 4, 17, 18, 22, 23, 24, 25, 27`
+
+To monitor custom pins:
+
+```json
+{
+  "gpio_pins": [4, 17, 27, 22]
+}
+```
 
 ### Pin Numbering
 
@@ -438,22 +653,26 @@ Labels make it easier to identify pins in your application:
 GPIO updates are sent **only when pin states change**. To test:
 
 **Method 1: Jumper Wires**
+
 - Connect a pin to 3.3V → value becomes `1`
 - Connect a pin to GND → value becomes `0`
 - Disconnect → value may float (unreliable without pull resistors)
 
 **Method 2: Button/Switch**
+
 - Connect button between pin and GND
 - Enable internal pull-up in code (requires modification)
 - Press button → value becomes `0`
 
 **Method 3: External Circuit**
+
 - Use sensors, switches, or other digital outputs
 - Ensure voltage is 3.3V (NOT 5V - this can damage the Pi!)
 
 ### Safety Notes
 
 ⚠️ **Important GPIO Safety:**
+
 - Never connect 5V directly to GPIO pins (use 3.3V max)
 - Avoid connecting outputs from multiple sources to the same pin
 - GPIO pins can source/sink ~16mA max
@@ -465,12 +684,14 @@ GPIO updates are sent **only when pin states change**. To test:
 ### WiFi Monitoring
 
 The WiFi monitor uses `iwconfig` to gather:
+
 - Connection status
 - SSID (network name)
 - IP address
 - Signal strength in dBm
 
 **Signal Strength Guide:**
+
 - `-30 to -50 dBm`: Excellent
 - `-50 to -60 dBm`: Good
 - `-60 to -70 dBm`: Fair
@@ -480,6 +701,7 @@ The WiFi monitor uses `iwconfig` to gather:
 ### Bluetooth Monitoring
 
 Monitors Bluetooth adapter status:
+
 - Whether Bluetooth is powered on
 - Whether any device is connected
 
@@ -507,11 +729,49 @@ Monitors Bluetooth adapter status:
 - Based on `/` mount point
 - Consider cleanup if above 90%
 
+### Health Summary
+
+The `health_summary` field provides quick boolean flags for common issues:
+
+| Flag | Condition | Default Threshold |
+|------|-----------|-------------------|
+| `cpu_hot` | CPU temperature exceeds threshold | > 80.0°C |
+| `disk_low` | Disk usage exceeds threshold | > 90% |
+| `memory_high` | Memory usage exceeds threshold | > 90% |
+| `wifi_poor` | WiFi signal below threshold | < -75 dBm |
+
+**Customizing Thresholds:**
+
+```json
+{
+  "cpu_temp_threshold_c": 75.0,
+  "disk_usage_threshold_percent": 85.0,
+  "memory_usage_threshold_percent": 85.0,
+  "wifi_signal_threshold_dbm": -70
+}
+```
+
+### Top Processes
+
+The system health snapshot includes the top 5 CPU-consuming processes:
+
+```json
+{
+  "system_health": {
+    "top_processes": [
+      {"name": "python", "pid": 1234, "cpu_percent": 12.5, "memory_percent": 3.2},
+      {"name": "chromium", "pid": 5678, "cpu_percent": 8.3, "memory_percent": 15.1}
+    ]
+  }
+}
+```
+
 ## Troubleshooting
 
 ### Server Won't Start
 
 **Error: `Address already in use`**
+
 ```bash
 # Find process using port 8000
 sudo lsof -i :8000
@@ -524,6 +784,7 @@ uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8001
 ```
 
 **Error: `ModuleNotFoundError: No module named 'rpi_simple_debugger'`**
+
 ```bash
 # Ensure you're in the virtual environment
 source .venv/bin/activate
@@ -537,6 +798,7 @@ pip install -e .[raspberry]
 **Error: `WARNING: Unsupported upgrade request`**
 
 This means WebSocket support is missing. Install it:
+
 ```bash
 pip install websockets
 ```
@@ -544,6 +806,7 @@ pip install websockets
 **Connection refused from another device:**
 
 Ensure:
+
 1. Server is running on `0.0.0.0`, not `127.0.0.1`
 2. Firewall allows port 8000
 3. You're using the correct IP address
@@ -559,6 +822,7 @@ curl http://localhost:8000/status
 ### No GPIO Data
 
 GPIO updates only occur when pins **change state**. To see data:
+
 1. Connect a pin to 3.3V or GND
 2. Use a button or switch
 3. Check that GPIO is enabled in config
@@ -566,6 +830,7 @@ GPIO updates only occur when pins **change state**. To see data:
 ### Permission Errors (GPIO)
 
 If you see GPIO permission errors:
+
 ```bash
 # Add your user to the gpio group
 sudo usermod -a -G gpio $USER
@@ -576,6 +841,7 @@ sudo usermod -a -G gpio $USER
 ### High CPU Usage
 
 If the server uses too much CPU:
+
 1. Increase polling intervals in configuration
 2. Disable unnecessary monitors
 3. Check for infinite loops in custom code
@@ -619,6 +885,7 @@ def read_root():
 ```
 
 Access debugger at:
+
 - `http://localhost:8000/debugger/status`
 - `ws://localhost:8000/debugger/ws`
 
@@ -666,6 +933,7 @@ uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8000
 ### Optimizing for Your Use Case
 
 **Low-latency GPIO monitoring:**
+
 ```json
 {
   "gpio_poll_interval_s": 0.05,
@@ -675,6 +943,7 @@ uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
 **Low CPU usage:**
+
 ```json
 {
   "gpio_poll_interval_s": 1.0,
@@ -684,6 +953,7 @@ uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8000
 ```
 
 **Battery-powered applications:**
+
 - Increase all polling intervals
 - Disable unnecessary monitors
 - Consider event-driven GPIO instead of polling (requires code modification)
@@ -691,6 +961,7 @@ uvicorn rpi_simple_debugger.app:create_app --factory --host 0.0.0.0 --port 8000
 ### Scaling Considerations
 
 For multiple concurrent WebSocket clients:
+
 - The server handles broadcasting to all connected clients
 - Memory usage scales with number of connections
 - Test with your expected number of clients
@@ -699,6 +970,7 @@ For multiple concurrent WebSocket clients:
 ### Network Performance
 
 Reduce WebSocket message frequency by:
+
 - Increasing polling intervals
 - Filtering data server-side
 - Implementing client-side throttling
